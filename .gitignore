@@ -1,0 +1,5 @@
+/gcstun
+/gcstun-linux
+*.json
+!go.*
+gcs-key.json
