@@ -45,6 +45,10 @@ func main() {
 		die(err)
 		d := time.Since(t).Seconds()
 		fmt.Printf("read %d bytes (http %d) in %.2fs = %.1f MB/s\n", len(b), st, d, float64(len(b))/1e6/d)
+	case "muxrelay":
+		runMuxRelay(os.Args[2:])
+	case "muxclient":
+		runMuxClient(os.Args[2:])
 	case "relay":
 		runRelay(os.Args[2:])
 	case "client":
