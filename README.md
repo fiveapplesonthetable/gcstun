@@ -127,6 +127,44 @@ Ballpark: light use pennies–$1/mo, heavy daily video a few $/mo. (Cloudflare R
 
 ---
 
+## Quick install (scripts)
+
+Once you have the GCS bucket + key (step 1 below) and a built `gcstun-linux`:
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o gcstun-linux .
+# on the EXIT machine (anywhere with internet — cloud box or a home VM):
+./install-exit.sh  /path/to/gcs-key.json  [bucket]
+# on the ENTRY box (inside Russia):
+./install-entry.sh /path/to/gcs-key.json  [bucket] [127.0.0.1:10921]
+```
+
+Each installs a systemd service (`gcstun-relay` / `gcsmuxcli`, `Restart=always`) and
+prints what to do next. Then point your xray VLESS inbound's SOCKS outbound at the entry
+listen address. See the full manual steps below if you'd rather do it by hand.
+
+## Adding or switching exit nodes
+
+The exit is outbound-only, so a new exit is just: run `install-exit.sh` on any machine.
+Two ways to use more than one, because **the multiplexed sequence assumes one relay per
+bucket**:
+
+- **Switching (failover / change country) — same bucket, one active at a time.** Run
+  `install-exit.sh` on the new box, then stop the old relay and start the new one on the
+  *same* bucket. The entry side needs **no change** (same QR); both ends auto-resync to
+  the new relay within a few seconds. Whichever machine runs the relay, its IP is the
+  exit — so a Frankfurt box vs a home VM vs a US box just means stopping one and starting
+  another.
+- **Several exits at once (a menu of exit IPs) — one bucket each.** Give each exit its
+  own bucket: `install-exit.sh key bucketA` on box A, `install-exit.sh key bucketB` on
+  box B. On the entry, run one client per bucket on different ports
+  (`install-entry.sh key bucketA 127.0.0.1:10921`, `... bucketB 127.0.0.1:10922`) and
+  add an xray inbound (a different VLESS UUID / port) per exit. The phone then picks an
+  exit by choosing which profile to connect to. Buckets are free, so this is cheap.
+
+> Only ever run **one** relay against a given bucket. Two relays on the same bucket both
+> read `up/<seq>` and collide.
+
 ## Detailed how-to (reproduce from scratch)
 
 You need two servers — an **entry** inside Russia (small/cheap is fine) and an **exit**
