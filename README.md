@@ -62,6 +62,13 @@ objects, and an entry that picks them up.
 - **Neither box ever connects to the other.** The RU box only talks to
   `storage.googleapis.com` (whitelisted). The exit only talks to GCS + the open
   internet. TSPU sees only innocuous GCS traffic.
+- **The exit is outbound-only — it needs no public IP, no inbound ports, no dedicated
+  VPS.** It just reads/writes the bucket and dials destinations. So it can run on *any*
+  machine with internet: a cloud box, or a home server / personal VM behind NAT. Whatever
+  runs the relay, its egress IP is what sites see as the VPN exit. (This deployment runs
+  the relay on a home VM via a systemd `gcstun-relay` service — no exit VPS at all.)
+  Switching the exit needs **no change** on the entry/phone side: stop the old relay,
+  start a new one on the same bucket, and it resyncs automatically.
 - **How the RU box tells the exit what to fetch:** it writes a tiny object
   `req/<sid>` = `"youtube.com:443"`. The exit polls GCS, sees it, and dials that
   destination. The instruction rides the same whitelisted dropbox as the data.
