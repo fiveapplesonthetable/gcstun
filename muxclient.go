@@ -22,8 +22,14 @@ import (
 type muxClient struct {
 	g      *GCS
 	out    *outbox
-	conns  sync.Map // uint32 -> net.Conn
+	conns  sync.Map // uint32 -> *cstream
 	nextID uint32
+}
+
+type cstream struct {
+	conn   net.Conn
+	outSeq uint32 // next up-DATA streamSeq to send (read loop only)
+	inSeq  uint32 // next down-DATA streamSeq expected (downReader only)
 }
 
 // socksTarget does the SOCKS5 handshake and returns the requested host:port.
@@ -70,30 +76,69 @@ func (m *muxClient) handle(c net.Conn) {
 		return
 	}
 	id := atomic.AddUint32(&m.nextID, 1)
-	m.conns.Store(id, c)
-	m.out.enq(id, fOpen, []byte(target))
+	s := &cstream{conn: c}
+	m.conns.Store(id, s)
+	m.out.enq(id, fOpen, 0, []byte(target))
 	c.Write([]byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0}) // optimistic success (saves a round-trip)
 	buf := make([]byte, 256*1024)
 	for {
 		n, err := c.Read(buf)
 		if n > 0 {
-			m.out.enq(id, fData, append([]byte(nil), buf[:n]...))
+			m.out.enq(id, fData, s.outSeq, append([]byte(nil), buf[:n]...))
+			s.outSeq++
 		}
 		if err != nil {
 			break
 		}
 	}
 	m.conns.Delete(id)
-	m.out.enq(id, fClose, nil)
+	m.out.enq(id, fClose, 0, nil)
 	c.Close()
 }
 
-// downReader pulls down/<seq> in order (with a parallel prefetch window for throughput),
-// demuxes each batch, and writes each frame to its stream's SOCKS connection.
+func (m *muxClient) closeAllClient() {
+	m.conns.Range(func(k, v any) bool {
+		m.conns.Delete(k)
+		v.(*cstream).conn.Close()
+		return true
+	})
+}
+
+func (m *muxClient) route(b []byte) {
+	parseFrames(b, func(stream uint32, typ byte, sseq uint32, data []byte) {
+		v, ok := m.conns.Load(stream)
+		if !ok {
+			return
+		}
+		s := v.(*cstream)
+		switch typ {
+		case fData:
+			if sseq != s.inSeq { // gap/dup — reset this stream cleanly, never deliver garbled bytes
+				if muxDebug {
+					log.Printf("mux client: stream %d down-gap got %d want %d — closing", stream, sseq, s.inSeq)
+				}
+				m.conns.Delete(stream)
+				s.conn.Close()
+				return
+			}
+			s.inSeq++
+			s.conn.Write(data)
+		case fClose:
+			m.conns.Delete(stream)
+			s.conn.Close()
+		}
+	})
+}
+
+// downReader pulls down/<seq> in order (parallel prefetch window for throughput), demuxes,
+// and delivers each frame to its stream. If it stalls on a missing object (loss or a relay
+// restart), it re-lists and resyncs (a generation counter abandons the stuck prefetches);
+// the per-stream seq in route() cleanly resets any stream that lost a batch.
 func (m *muxClient) downReader() {
-	fetch := func(seq int) []byte {
+	var gen int64
+	fetch := func(seq int, g int64) []byte {
 		name := fmt.Sprintf("down/%d", seq)
-		for {
+		for atomic.LoadInt64(&gen) == g {
 			b, st, err := m.g.Get(name)
 			if err == nil && st == 200 {
 				go m.g.Delete(name)
@@ -101,34 +146,48 @@ func (m *muxClient) downReader() {
 			}
 			time.Sleep(muxPoll)
 		}
+		return nil // abandoned by a resync
 	}
-	inflight := map[int]chan []byte{}
-	start := func(seq int) {
-		ch := make(chan []byte, 1)
-		inflight[seq] = ch
-		go func() { ch <- fetch(seq) }()
-	}
-	for i := 0; i < muxWindow; i++ {
-		start(i)
-	}
-	next := 0
-	for {
-		b := <-inflight[next]
-		delete(inflight, next)
-		parseFrames(b, func(stream uint32, typ byte, data []byte) {
-			switch typ {
-			case fData:
-				if v, ok := m.conns.Load(stream); ok {
-					v.(net.Conn).Write(data)
+	for { // (re)start the window from the current position
+		g := atomic.LoadInt64(&gen)
+		next := 0
+		if lo := minSeq(m.g, "down"); lo > 0 {
+			next = lo
+		}
+		inflight := map[int]chan []byte{}
+		start := func(seq int) {
+			ch := make(chan []byte, 1)
+			inflight[seq] = ch
+			go func() { ch <- fetch(seq, g) }()
+		}
+		for i := 0; i < muxWindow; i++ {
+			start(next + i)
+		}
+		resync := false
+		for !resync {
+			select {
+			case b := <-inflight[next]:
+				delete(inflight, next)
+				if b == nil { // abandoned
+					resync = true
+					break
 				}
-			case fClose:
-				if v, ok := m.conns.LoadAndDelete(stream); ok {
-					v.(net.Conn).Close()
+				m.route(b)
+				start(next + muxWindow)
+				next++
+			case <-time.After(muxStall):
+				if lo := minSeq(m.g, "down"); lo >= 0 && lo != next {
+					if muxDebug {
+						log.Printf("mux client: down resync %d -> %d", next, lo)
+					}
+					if lo < next {
+						m.closeAllClient() // relay restarted — drop stale streams
+					}
+					atomic.AddInt64(&gen, 1) // abandon in-flight fetches; outer loop restarts
+					resync = true
 				}
 			}
-		})
-		start(next + muxWindow)
-		next++
+		}
 	}
 }
 
@@ -139,8 +198,9 @@ func runMuxClient(args []string) {
 	listen := fs.String("listen", "127.0.0.1:10921", "SOCKS5 listen")
 	flush := fs.Duration("flush", muxFlush, "batch coalesce window")
 	win := fs.Int("window", muxWindow, "parallel down prefetches")
+	dbg := fs.Bool("debug", false, "log resyncs and per-stream gaps")
 	fs.Parse(args)
-	muxFlush, muxWindow = *flush, *win
+	muxFlush, muxWindow, muxDebug = *flush, *win, *dbg
 	kb, err := os.ReadFile(*key)
 	die(err)
 	g, err := NewGCS(kb, *bucket)

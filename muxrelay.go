@@ -20,7 +20,29 @@ var (
 	muxChunk  = 1024 * 1024           // ...but flush early past this size (throughput for bulk)
 	muxPoll   = 40 * time.Millisecond // poll interval waiting for the next object
 	muxWindow = 16                    // client: parallel down prefetches (throughput)
+	muxStall  = 3 * time.Second       // if a reader waits this long for one object, re-list & resync
+	muxDebug  bool
 )
+
+// minSeq lists prefix/ and returns the lowest numeric sequence present (the next object
+// still waiting to be read), or -1 if none. Used to resync a reader that is stuck polling
+// an object that was lost or that a restart skipped past.
+func minSeq(g *GCS, prefix string) int {
+	names, err := g.List(prefix+"/", 1000)
+	if err != nil {
+		return -1
+	}
+	lo := -1
+	for _, n := range names {
+		var s int
+		if _, e := fmt.Sscanf(n, prefix+"/%d", &s); e == nil {
+			if lo == -1 || s < lo {
+				lo = s
+			}
+		}
+	}
+	return lo
+}
 
 // batched object writer shared by both ends.
 type outbox struct {
@@ -32,12 +54,12 @@ type outbox struct {
 	seq    int
 }
 
-func (o *outbox) enq(stream uint32, typ byte, data []byte) {
+func (o *outbox) enq(stream uint32, typ byte, sseq uint32, data []byte) {
 	o.mu.Lock()
 	if len(o.buf) == 0 {
 		o.dirty = time.Now()
 	}
-	o.buf = appendFrame(o.buf, stream, typ, data)
+	o.buf = appendFrame(o.buf, stream, typ, sseq, data)
 	o.mu.Unlock()
 }
 
@@ -74,6 +96,8 @@ type rstream struct {
 	pending [][]byte
 	ready   bool
 	closed  bool
+	inSeq   uint32 // next up-DATA streamSeq expected (checked by the up-reader)
+	outSeq  uint32 // next down-DATA streamSeq to send (used by the read loop)
 }
 
 func (s *rstream) data(b []byte) {
@@ -124,7 +148,7 @@ func (m *muxRelay) dialStream(stream uint32, s *rstream, target string) {
 	conn, err := net.DialTimeout("tcp", target, 15*time.Second)
 	if err != nil {
 		m.conns.Delete(stream)
-		m.out.enq(stream, fClose, nil)
+		m.out.enq(stream, fClose, 0, nil)
 		return
 	}
 	if tc, ok := conn.(*net.TCPConn); ok {
@@ -135,7 +159,8 @@ func (m *muxRelay) dialStream(stream uint32, s *rstream, target string) {
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
-			m.out.enq(stream, fData, append([]byte(nil), buf[:n]...))
+			m.out.enq(stream, fData, s.outSeq, append([]byte(nil), buf[:n]...))
+			s.outSeq++
 		}
 		if err != nil {
 			break
@@ -143,7 +168,15 @@ func (m *muxRelay) dialStream(stream uint32, s *rstream, target string) {
 	}
 	m.conns.Delete(stream)
 	s.close()
-	m.out.enq(stream, fClose, nil)
+	m.out.enq(stream, fClose, 0, nil)
+}
+
+func (m *muxRelay) closeAll() {
+	m.conns.Range(func(k, v any) bool {
+		m.conns.Delete(k)
+		v.(*rstream).close()
+		return true
+	})
 }
 
 func (m *muxRelay) run() {
@@ -152,6 +185,7 @@ func (m *muxRelay) run() {
 	for {
 		name := fmt.Sprintf("up/%d", seq)
 		var buf []byte
+		waited := time.Duration(0)
 		for {
 			b, st, err := m.g.Get(name)
 			if err == nil && st == 200 {
@@ -159,9 +193,25 @@ func (m *muxRelay) run() {
 				break
 			}
 			time.Sleep(muxPoll)
+			if waited += muxPoll; waited >= muxStall {
+				// Stuck too long: the object was lost, or the client restarted and its
+				// sequence reset. Re-list and jump to whatever object actually exists next.
+				// Per-stream seq (below) cleanly resets any stream that lost a batch.
+				if lo := minSeq(m.g, "up"); lo >= 0 && lo != seq {
+					if muxDebug {
+						log.Printf("mux relay: up resync %d -> %d", seq, lo)
+					}
+					if lo < seq {
+						m.closeAll() // client restarted — drop stale streams
+					}
+					seq = lo
+					name = fmt.Sprintf("up/%d", seq)
+				}
+				waited = 0
+			}
 		}
 		go m.g.Delete(name)
-		parseFrames(buf, func(stream uint32, typ byte, data []byte) {
+		parseFrames(buf, func(stream uint32, typ byte, sseq uint32, data []byte) {
 			switch typ {
 			case fOpen:
 				s := &rstream{}
@@ -169,7 +219,18 @@ func (m *muxRelay) run() {
 				go m.dialStream(stream, s, string(append([]byte(nil), data...)))
 			case fData:
 				if v, ok := m.conns.Load(stream); ok {
-					v.(*rstream).data(append([]byte(nil), data...))
+					s := v.(*rstream)
+					if sseq != s.inSeq { // gap/dup on this stream — reset it cleanly
+						if muxDebug {
+							log.Printf("mux relay: stream %d up-gap got %d want %d — closing", stream, sseq, s.inSeq)
+						}
+						m.conns.Delete(stream)
+						s.close()
+						m.out.enq(stream, fClose, 0, nil)
+						return
+					}
+					s.inSeq++
+					s.data(append([]byte(nil), data...))
 				}
 			case fClose:
 				if v, ok := m.conns.LoadAndDelete(stream); ok {
@@ -186,8 +247,9 @@ func runMuxRelay(args []string) {
 	key := fs.String("key", "/root/gcs-key.json", "service account key")
 	bucket := fs.String("bucket", "cyclevpn-xport-eu", "GCS bucket")
 	flush := fs.Duration("flush", muxFlush, "batch coalesce window")
+	dbg := fs.Bool("debug", false, "log resyncs and per-stream gaps")
 	fs.Parse(args)
-	muxFlush = *flush
+	muxFlush, muxDebug = *flush, *dbg
 	kb, err := os.ReadFile(*key)
 	die(err)
 	g, err := NewGCS(kb, *bucket)
