@@ -9,6 +9,23 @@ This is a different approach from connection-cycling (see the `cyclevpn` project
 trades a bit of latency for **~10× the throughput**, which makes it excellent for
 video and downloads.
 
+## Two transports
+
+gcstun has two modes. **Prefer `mux`.**
+
+- **`muxclient` / `muxrelay` (recommended, default in production).** *Multiplexed:* ALL
+  connections share one pair of object streams (`up/<seq>`, `down/<seq>`), so the GCS
+  round-trip latency is amortised across every connection at once. 2–3× faster and more
+  consistent for the many-connection workloads (YouTube, page loads). This is what the
+  wire-protocol and how-it-works sections below describe under "mux".
+- **`client` / `relay` (per-session, simpler).** One object-stream *per* connection
+  (`req/<sid>`, `up/<sid>/<seq>`, `down/<sid>/<seq>`). Easier to reason about, but each
+  connection pays the ~1s GCS round-trip on its own. Kept as a fallback.
+
+> **Note on the two schemes:** the per-session mode announces each connection with a
+> separate `req/<sid>` object; the mux mode has **no `req/`** — opening a connection is
+> an OPEN *frame* folded into `up/`. See the wire protocol below.
+
 ---
 
 ## Why this works
@@ -82,6 +99,17 @@ So the tunnel itself does 100+ Mbit/s (≈20× the cycling tunnel); slower numbe
 *destination* pacing that specific connection, which is outside the tunnel's control.
 Raw GCS read from the RU box is ~190 Mbit/s, so GCS is never the limit.
 
+**Mux vs per-session, many parallel connections** (the YouTube case — measured, 15
+parallel requests):
+
+| | per-session | **mux** |
+|---|---|---|
+| 15 parallel connections | 7–12 s, inconsistent | **~3.8 s, every time** |
+| single-connection reliability | flaky under some timing | **solid** |
+
+The mux batches all connections into one GCS round-trip, so the per-request latency is
+shared instead of paid per connection — 2–3× faster for real browsing/video.
+
 ## Cost
 
 GCS charges for **egress** (data read down to the RU box): ~**$0.12/GB**. Storage is
@@ -131,6 +159,12 @@ GOOS=linux GOARCH=amd64 go build -o gcstun-linux .
 scp gcstun-linux root@<exit>:/root/gcstun
 scp gcstun-linux root@<entry>:/root/gcstun
 ```
+
+> The systemd units below use the per-session `relay`/`client` modes for clarity. For
+> the faster **mux** transport, just swap the subcommand: `muxrelay` on the exit and
+> `muxclient` on the entry (same flags). Use one *or* the other on a given bucket, not
+> both. (If two services share `/root/gcstun`, give each its own copy of the binary —
+> replacing a file a running process holds fails with `ETXTBSY`.)
 
 ### 3. Exit box (outside Russia) — the relay
 
@@ -255,6 +289,37 @@ So in steady state the bucket holds only the handful of chunks currently in flig
 (the prefetch/write window), and everything else has already been deleted by whoever
 consumed it. Object names are deterministic (`sid` + direction + sequence), so neither
 side ever has to search for "where the next file is" — it computes the name.
+
+### Multiplexed (mux) protocol — the recommended mode
+
+The mux mode collapses all connections onto **one** pair of object streams and has **no
+`req/` and no per-connection objects**:
+
+- `up/<seq>` — entry → exit, a **batch of frames** for many connections.
+- `down/<seq>` — exit → entry, a batch of frames.
+
+Each frame is `streamID(4) | type(1) | len(4) | data`, where type is **OPEN** (data =
+`"host:port"`), **DATA** (raw bytes), or **CLOSE**. So instead of a separate `req/`
+object, a new connection is just an **OPEN frame** at the front of its stream, riding in
+`up/` alongside everyone else's data:
+
+```
+up/42:  [5|OPEN|"youtube.com:443"]  [6|OPEN|"wikipedia.org:443"]  [5|DATA|<bytes>] ...
+```
+
+- The entry gives each connection a unique **stream id** and batches all streams' bytes
+  (coalesced ~15 ms, or sooner past a size cap) into the next `up/<seq>`.
+- The exit reads `up/<seq>` in order, demuxes, dials on OPEN, writes DATA to the right
+  socket; responses are batched back into `down/<seq>`.
+- The entry reads `down/<seq>` (with a parallel prefetch window for throughput),
+  demuxes, and delivers each frame **only to the connection whose stream id is on it**.
+
+Because the whole batch is one GCS round-trip, the ~0.4 s Storage latency is paid once
+for every active connection at once. And because a frame is delivered strictly by stream
+id, many phones behind one entry (one bucket, same QR) never see each other's traffic.
+Batch writes retry until success, and both ends read the sequence in strict order, so
+the shared numbering stays in lockstep. (One entry per bucket — two separate entry boxes
+would both number from `up/0` and collide.)
 
 ## How it works internally
 
