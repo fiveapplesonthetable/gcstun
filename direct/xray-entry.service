@@ -1,0 +1,14 @@
+[Unit]
+Description=xray VLESS entry for gcstun
+After=network-online.target wg-quick@wg-exit.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/root/xray/xray run -c /root/entry.json
+Environment=XRAY_LOCATION_ASSET=/root/xray
+WorkingDirectory=/root/xray
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

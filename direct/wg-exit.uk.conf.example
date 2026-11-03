@@ -1,0 +1,11 @@
+# UK / exit side. This machine dials Moscow. PrivateKey is not stored in git.
+[Interface]
+Address = 10.67.0.2/24
+MTU = 1280
+PrivateKey = <PRIVATE>
+
+[Peer]
+PublicKey = +IWs5/mfsFMJWKiIoTf0fPJIAdB6MXxe2kr2ssqdbyg=
+Endpoint = 176.113.82.126:51821
+AllowedIPs = 10.67.0.1/32
+PersistentKeepalive = 25

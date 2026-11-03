@@ -1,0 +1,11 @@
+# Moscow / entry side. It listens. It does not need this machine's public IP.
+# WireGuard learns the UK endpoint from the packets. PrivateKey is not stored in git.
+[Interface]
+Address = 10.67.0.1/24
+ListenPort = 51821
+MTU = 1280
+PrivateKey = <PRIVATE>
+
+[Peer]
+PublicKey = ltLnq0h278W+dcgUESSd/Pqe0YdvWbpwNfDNKVNfSj4=
+AllowedIPs = 10.67.0.2/32

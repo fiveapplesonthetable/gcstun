@@ -1,5 +1,10 @@
 # gcstun
 
+**The live path is [`direct/`](direct/README.md).** The phone still uses the same
+VLESS profile into Moscow. Moscow reaches the UK machine over WireGuard, and
+`direct-socks.py` opens the site. Russian names try Moscow first and fall back to
+the UK. The GCS tunnel below is the previous transport. It is not what is running.
+
 A VPN transport that defeats Russia's TSPU throttle by tunnelling through **Google
 Cloud Storage** — a destination the throttle *whitelists* and lets through at full
 speed. The two servers never talk to each other directly; they only ever read and

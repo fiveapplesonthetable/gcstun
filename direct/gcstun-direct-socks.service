@@ -1,0 +1,13 @@
+[Unit]
+Description=SOCKS5 exit for the direct Moscow tunnel
+After=network-online.target wg-quick@wg-exit.service
+Wants=network-online.target wg-quick@wg-exit.service
+
+[Service]
+User=zim
+ExecStart=/usr/bin/python3 /home/zim/gcstun/direct-socks.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
